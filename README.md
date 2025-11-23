@@ -1,1059 +1,656 @@
-# 🏷 RFID Voting System with Face Verification (Arbitrum Stylus)
-
-A fully on-chain RFID voting system with **face verification**, powered by a **Rust smart contract on Arbitrum Stylus**, a Node.js + Python backend, a React frontend, and an ESP32 + RFID hardware setup.
-
-This project was built for the **Arbitrum Stylus Hackathon** to showcase how **real‑world IoT devices**, **biometric verification**, and **high‑performance WASM contracts** can come together on Arbitrum.
-
----
-
-## 📚 Table of Contents
-
-- [Overview](#overview)
-- [Why Arbitrum Stylus](#why-arbitrum-stylus)
-- [Architecture](#architecture)
-- [Smart Contract (Rust + Stylus)](#smart-contract-rust--stylus)
-  - [Contract Design](#contract-design)
-  - [Storage Layout](#storage-layout)
-  - [Key Functions](#key-functions)
-  - [Errors & Events](#errors--events)
-  - [Stylus‑Specific Considerations](#stylus-specific-considerations)
-- [Backend (Node.js + Python)](#backend-nodejs--python)
-  - [Responsibilities](#responsibilities)
-  - [Face Verification Pipeline](#face-verification-pipeline)
-  - [Endpoints](#endpoints)
-- [Frontend (React)](#frontend-react)
-  - [Features](#features)
-- [Hardware (ESP32 + MFRC522)](#hardware-esp32--mfrc522)
-- [Repository Structure](#repository-structure)
-- [Local Development](#local-development)
-  - [1. Smart Contract Setup](#1-smart-contract-setup)
-  - [2. Backend Setup](#2-backend-setup)
-  - [3. Frontend Setup](#3-frontend-setup)
-  - [4. ESP32 / Arduino Setup](#4-esp32--arduino-setup)
-- [Deployment](#deployment)
-  - [Backend Deployment](#backend-deployment)
-  - [Frontend Deployment](#frontend-deployment)
-- [Security Considerations](#security-considerations)
-- [Future Improvements](#future-improvements)
-- [License](#license)
-
----
-
-## Overview
-
-This system lets a voter:
-
-1. Tap an **RFID tag** on an **ESP32 + MFRC522** reader.
-2. Undergo **face verification** via a Python OpenCV window.
-3. If verified and not previously used, their vote is **cast on‑chain** to an Arbitrum Stylus **Rust smart contract**.
-4. A React dashboard displays:
-   - Total votes
-   - Votes per candidate (button)
-   - Full vote history (tag, button, timestamp, date)
-   - Winner selection and admin tools (for the contract owner)
-
-The core innovation is that the **voting logic and state live entirely on Arbitrum** while using **Rust/WASM (Stylus)** instead of Solidity, giving much better performance and memory efficiency for more complex applications. The off‑chain components (backend, hardware, face recognition) act as secure oracles around that contract.
-
----
-
-## Why Arbitrum Stylus
-
-Arbitrum Stylus extends Arbitrum Nitro with a **WASM‑based smart contract environment** that runs alongside the EVM. Key advantages for this project:
-
-- **Rust Smart Contracts**  
-  Stylus lets contracts be written in **Rust**, compiled to **WASM**, and executed on Arbitrum while remaining fully interoperable with standard Solidity/EVM contracts. This unlocks the entire Rust ecosystem for on‑chain logic.
-
-- **Massive Performance Gains**  
-  Stylus WASM contracts are typically **10× more compute‑efficient** and offer **100–500× cheaper memory** compared to standard EVM execution. This is ideal for more complex voting logic, audit trails, and future features like on‑chain cryptography or analytics.
-
-- **Multi‑VM Interoperability**  
-  Stylus contracts can interact seamlessly with Solidity contracts on the same chain. If needed, this project could later integrate with existing DeFi/NFT infrastructure on Arbitrum using normal Solidity interfaces, while keeping the heavy logic in Rust.
-
-- **Developer Accessibility**  
-  Instead of learning Solidity from scratch, the core on‑chain logic leverages **idiomatic Rust** and the Stylus SDK. This is a more natural stack for systems and embedded developers (which fits well with the ESP32/IoT background of the project).
-
-- **Fully Ethereum‑Secured**  
-  Stylus runs inside Arbitrum’s Nitro architecture: execution disputes are verified via WASM one‑step proofs, with final settlement and security anchored to Ethereum.
-
-This project demonstrates how Stylus can be used for **IoT + biometric + voting** workloads that would otherwise be too complex or expensive purely in Solidity.
-
----
-
-## Architecture
-
-High‑level architecture:
-
-text
-    ┌───────────────────────────────┐
-    │           Frontend            │
-    │         (React + Web3)        │
-    │  - User dashboard             │
-    │  - Owner controls             │
-    │  - Connects via MetaMask      │
-    └─────────────▲─────────────────┘
-                  │ REST + RPC
-                  │
-    ┌─────────────┴─────────────────┐
-    │            Backend             │
-    │       (Node.js + Python)       │
-    │  - Express REST API            │
-    │  - ethers.js → Stylus SC       │
-    │  - Face verification (Python)  │
-    │  - Query & aggregate votes     │
-    └─────────────▲─────────────────┘
-                  │ Serial/WiFi/HTTP
-                  │
-    ┌─────────────┴─────────────────┐
-    │            ESP32               │
-    │    + MFRC522 RFID Reader      │
-    │  - Reads tag ID               │
-    │  - Sends tag + button input   │
-    │  - UI buttons for candidates  │
-    └─────────────▲─────────────────┘
-                  │
-    ┌─────────────┴─────────────────┐
-    │      Arbitrum Stylus SC       │
-    │          (Rust/WASM)          │
-    │  - Stores all votes           │
-    │  - One vote per tag           │
-    │  - Button tallies             │
-    │  - Winner computation         │
-    └───────────────────────────────┘
-text
-
----
-
-## Smart Contract (Rust + Stylus)
-
-### Contract Design
-
-The contract is implemented in Rust using the **Stylus SDK** and compiled to WebAssembly. It is deployed on **Arbitrum Sepolia** at:
-
-- **Network**: Arbitrum Sepolia
-- **Address**: `0x16f7b54cb4002b5ca98a07ee44d81802e1009977`  
-  (replace here if redeployed)
-
-The main goals:
-
-- Store each vote **on‑chain** as `(tag_id, button_number, timestamp)`.
-- Enforce **one vote per RFID tag**.
-- Maintain per‑button vote counts.
-- Allow the owner to:
-  - Reset a tag’s vote status if needed.
-  - Query the winning button and its votes.
-
-### Storage Layout
-
-sol_storage! {
-#[entrypoint]
-pub struct RFIDVoting {
-address owner;
-StorageVec<VoteData> votes;
-mapping(string => bool) has_voted;
-mapping(uint256 => uint256) button_votes;
-bool locked; // reentrancy guard
-}
-
-text
-pub struct VoteData {
-    StorageString tag_id;
-    uint256 button_number;
-    uint256 timestamp;
-}
-}
-
-text
-
-- `owner`: Address of the contract owner (can reset votes, transfer ownership).
-- `votes`: List of all votes ever cast.
-- `has_voted[tag_id]`: Prevents a tag from voting more than once.
-- `button_votes[button_number]`: Total votes per candidate/button.
-- `locked`: Simple reentrancy guard flag.
-
-The use of `StorageVec` and `StorageString` is specific to Stylus’ storage SDK for Rust.
-
-### Key Functions
-
-**Initialize**
-
-pub fn initialize(&mut self) -> Result<(), RFIDVotingError>
-
-text
-
-- Sets `owner` to `msg::sender()`.
-- Unlocks the contract.
-- Should be called once after deployment.
-
-**Cast Vote**
-
-pub fn cast_vote(&mut self, tag_id: String, button_number: U256) -> Result<(), RFIDVotingError>
-
-text
-
-- Checks `locked` to prevent reentrancy.
-- Ensures `has_voted[tag_id] == false`, otherwise reverts with `AlreadyVoted`.
-- Gets current block timestamp via `block::timestamp()`.
-- Appends a new `VoteData` entry to `votes`.
-- Sets `has_voted[tag_id] = true`.
-- Increments `button_votes[button_number]`.
-- Emits a `VoteCast` event.
-- Unlocks the contract.
-
-**Get Vote Count**
-
-pub fn get_vote_count(&self) -> U256
-
-text
-
-- Returns `votes.len()` as a `U256`.
-
-**Get Vote by Index**
-
-pub fn get_vote(&self, index: U256) -> Result<(String, U256, U256), RFIDVotingError>
-
-text
-
-- Bounds checks the index.
-- Returns `(tag_id, button_number, timestamp)` for the given vote.
-
-**Pick Winner**
-
-pub fn pick_winner(&self) -> Result<(U256, U256), RFIDVotingError>
-
-text
-
-- Requires at least one vote (`NoVotes` error otherwise).
-- Iterates over `votes` and looks up `button_votes` to find the button with maximum votes.
-- Returns `(winning_button, votes_for_that_button)`.
-
-**Reset Vote**
-
-pub fn reset_vote(&mut self, tag_id: String) -> Result<(), RFIDVotingError>
-
-text
-
-- Only callable by `owner()`.
-- Sets `has_voted[tag_id] = false`.
-- (Does not retroactively remove the old vote from `votes`; this is more of an “unlock” for re‑voting.)
-
-**Owner & Ownership Transfer**
-
-pub fn owner(&self) -> Address
-pub fn transfer_ownership(&mut self, new_owner: Address) -> Result<(), RFIDVotingError>
-
-text
-
-- Standard ownership pattern.
-- Emits `OwnershipTransferred` event.
-
-**Button Votes & Tag Check**
-
-pub fn get_button_votes(&self, button_number: U256) -> U256
-pub fn check_has_voted(&self, tag_id: String) -> bool
-
-text
-
-- Read‑only helper queries used heavily by the backend and frontend.
-
-### Errors & Events
-
-Defined via `sol!` macro for ABI compatibility:
-
-sol! {
-event VoteCast(string tag_id, uint256 button_number, uint256 timestamp);
-event WinnerDeclared(uint256 winning_button, uint256 votes);
-event OwnershipTransferred(address indexed previous_owner, address indexed new_owner);
-
-text
-error AlreadyVoted(string message);
-error NoVotes(string message);
-error InvalidIndex(string message);
-error NotOwner(string message);
-error ReentrancyGuard(string message);
-}
-
-text
-
-These provide clean, human‑readable revert reasons and indexable events for off‑chain indexing.
-
-### Stylus‑Specific Considerations
-
-- Uses the Stylus **`evm`, `msg`, and `block` modules** for:
-  - `msg::sender()` for caller.
-  - `block::timestamp()` for time.
-  - `evm::log` for emitting events.
-- `StorageString` and `StorageVec` are part of the Stylus SDK, optimized for WASM storage layout.
-- Designed to be **EVM‑compatible at the ABI level**, so the Node.js backend can use standard `ethers.js` with a normal JSON ABI.
-- Takes advantage of Stylus’ **cheap memory and fast CPU** to safely store and iterate over a growing vote history.
-
----
-
-## Backend (Node.js + Python)
-
-### Responsibilities
-
-- Provides an **HTTP REST API** consumed by:
-  - The React frontend (for dashboard/data).
-  - The ESP32 (for casting votes).
-- Handles:
-  - MetaMask / Web3 is not used directly here; instead, backend holds a **server wallet** (private key) that signs all vote transactions.
-  - ABI calls to the Arbitrum Stylus contract using **ethers.js v6**.
-  - Aggregation and formatting of vote data for the frontend.
-
-### Face Verification Pipeline
-
-- Written in **Python** (`face_verify.py`).
-- Uses:
-  - `face_recognition` for embedding + comparison.
-  - `opencv-python` for webcam streaming.
-- Flow:
-  1. Backend receives `/vote` request with `{ tagId, buttonId }`.
-  2. Backend checks `/checkHasVoted(tagId)` via contract.
-  3. If not voted:
-     - Spawns Python process with `face_verify.py` and `tagId`.
-     - Python loads reference image from `backend/faces/{tagId}.jpg`.
-     - Captures live webcam frames, computes face embeddings.
-     - Compares distance; if below threshold → verified.
-  4. Node reads Python’s exit code / stdout to decide success.
-  5. Only then calls `castVote(tagId, buttonId)` on the Stylus contract.
-
-This design treats the Python pipeline as a **local biometric oracle**.
-
-### Endpoints
-
-All under `http://localhost:3000` (or your deployed URL):
-
-- `GET /health`  
-  Returns basic status and contract address.
-
-- `POST /initialize`  
-  Calls `initialize()` on the contract.
-
-- `POST /vote`  
-  Body: `{ tagId, buttonId }`  
-  Runs face verification, checks tag status, and casts vote.
-
-- `GET /votes/count`  
-  Returns total vote count from `getVoteCount()`.
-
-- `GET /votes/all`  
-  Returns full vote history with decoded `(tagId, buttonNumber, timestamp, date)`.
-
-- `GET /check/:tagId`  
-  Returns whether the tag has already voted (`checkHasVoted`).
-
-- `GET /button/:buttonNumber`  
-  Returns vote count for a specific button (`getButtonVotes`).
-
-- `GET /winner`  
-  Calls `pickWinner()` on the contract and returns the winning button and votes.
-
-- `POST /reset`  
-  Body: `{ tagId }`  
-  Owner‑only endpoint; calls `resetVote(tagId)`.
-
-- `GET /owner`  
-  Returns current owner address from `owner()`.
-
----
-
-## Frontend (React)
-
-### Features
-
-- **Wallet Connection**  
-  - Uses `ethers` and `window.ethereum` (MetaMask) to:
-    - Display connected address.
-    - Check network (Arbitrum Sepolia chain ID).
-    - Show contract owner badge for the deployer.
-
-- **Contract Initialization Flow**
-  - If `owner == 0x000...0`, shows an “Initialize Contract” section.
-  - First initializer becomes the contract owner.
-
-- **Voting UI**
-  - Inputs:
-    - RFID Tag ID (string, e.g. `9158283` or `AC6955D3`).
-    - Button number (integer, candidate ID).
-  - On submit:
-    - Calls backend `/check/:tagId`.
-    - Initiates face verification via backend `/vote`.
-    - Shows rich status messages throughout the flow.
-
-- **Results Dashboard**
-  - Total votes, active buttons, contract owner, current leader.
-  - Per‑button vote breakdown.
-  - Full vote history table:
-    - Index
-    - Tag ID
-    - Button
-    - Raw timestamp
-    - Human‑readable date/time
-
-- **Query Tools**
-  - Check if a tag has voted.
-  - Query vote count for a specific button.
-  - Owner‑only: pick winner and show official winning button.
-
----
-
-## Hardware (ESP32 + MFRC522)
-
-- **ESP32** runs Arduino sketch `decentralised_elections.ino`.
-- **MFRC522** RFID reader:
-  - Reads card/tag UID.
-  - Sends tag + button input to backend (typically via WiFi HTTP or serial bridge).
-- **Buttons**:
-  - Mapped to candidate IDs (1..N).
-- ESP32 acts as a **trusted voting terminal** that triggers the backend `/vote` endpoint.
-
----
-
-## Repository Structure
-
-Adapt this to your actual repo layout:
-
-Arbitrum-Hackathon/
-├── decentralised_elections/
-│ └── decentralised_elections.ino # ESP32 + RFID Arduino code
-├── RFID-voting/
-│ ├── rfid-voting-backend/
-│ │ ├── index.js # Express + ethers + Stylus integration
-│ │ ├── faceAuth.js # Node wrapper around Python
-│ │ ├── face_verify.py # OpenCV + face_recognition
-│ │ ├── abi.json # Stylus contract ABI
-│ │ ├── package.json
-│ │ ├── package-lock.json
-│ │ ├── faces/ # Reference images (tagId.jpg)
-│ │ │ └── .gitkeep
-│ │ └── .env.example
-│ └── rfid-voting-frontend/
-│ └── researchproject/
-│ ├── src/
-│ │ ├── App.js # React UI
-│ │ └── App.css
-│ ├── public/
-│ ├── package.json
-│ └── README.md
-└── smart-contract/ # (teammate added; path may differ)
-├── src/
-│ └── lib.rs # Rust Stylus contract
-├── Cargo.toml
-└── README.md
-
-text
-
----
-
-## Local Development
-
-### 1. Smart Contract Setup
-
-Requirements:
-- Rust (stable)
-- `cargo stylus`
-- Arbitrum Stylus toolchain installed
-- Wallet/private key with Arbitrum Sepolia test ETH
-
-Typical workflow:
-
-cd smart-contract
-
-Optional: run checks
-cargo stylus check
-
-Build & deploy to Arbitrum Sepolia
-cargo stylus deploy
---private-key YOUR_PRIVATE_KEY
---rpc-url https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY
-
-text
-
-After deployment:
-- Update `CONTRACT_ADDRESS` in `backend/.env`.
-- Export ABI (`abi.json`) and copy it to backend.
-
-### 2. Backend Setup
-
-cd RFID-voting/rfid-voting-backend
-
-Install Node dependencies
-npm install
-
-(Optional) Create virtual env for Python
-python -m venv .venv310
-.venv310\Scripts\activate
-Install Python dependencies
-pip install face_recognition opencv-python numpy
-
-Create env file
-cp .env.example .env
-
-Edit .env with your values
-- ALCHEMY_RPC_URL
-- PRIVATE_KEY
-- CONTRACT_ADDRESS
-- PORT
-Run backend
-node index.js
-
-text
-
-Backend will start on `http://localhost:3000` by default.
-
-### 3. Frontend Setup
-
-cd RFID-voting/rfid-voting-frontend/researchproject
-
-npm install
-
-Optionally, set backend URL
-echo REACT_APP_BACKEND_URL=http://localhost:3000 > .env
-npm start
-
-text
-
-Visit `http://localhost:3000` in your browser (create‑react‑app dev server).
-
-### 4. ESP32 / Arduino Setup
-
-1. Open **Arduino IDE**.
-2. Install required libraries:
-   - `ESP32` board package
-   - `MFRC522` for RFID
-   - `WiFi` / `HTTPClient` as needed
-3. Open `decentralised_elections/decentralised_elections.ino`.
-4. Update:
-   - WiFi SSID / password.
-   - Backend URL (e.g. `http://192.168.1.X:3000/vote`).
-5. Select **ESP32 Dev Module**, correct COM port.
-6. Upload.
-
----
-
-## Deployment
-
-### Backend Deployment
-
-You can deploy the backend to any Node‑friendly host (Railway, Render, etc.). At a high level:
-
-1. Push this repo to GitHub (already done).
-2. On your chosen platform:
-   - Select `RFID-voting/rfid-voting-backend` as the root.
-   - Set `start` script: `node index.js`.
-   - Configure environment variables:
-     - `ALCHEMY_RPC_URL`
-     - `PRIVATE_KEY`
-     - `CONTRACT_ADDRESS`
-     - `PORT` (usually 3000 or as required by the host).
-
-3. Update frontend’s `REACT_APP_BACKEND_URL` to this new URL.
-
-> Note: Cloud environments generally cannot access a local webcam, so the **Python face verification** component is best run on a local server or a dedicated machine with camera access. For a pure cloud demo, you can optionally bypass or mock the face check.
-
-### Frontend Deployment
-
-**Vercel** is a great fit for the React app:
-
-1. Import the repo `kushagrakartikeye/Arbitrum-Hackathon` into Vercel.
-2. Set project root to `RFID-voting/rfid-voting-frontend/researchproject`.
-3. Add environment variable:
-   - `REACT_APP_BACKEND_URL=https://your-backend-host.com`
-4. Deploy.
-
----
-
-## Security Considerations
-
-- **Biometric Data**  
-  Face images are stored locally as static `.jpg` files under `backend/faces/`. They are **not** uploaded to GitHub (.gitignore). For production, consider encrypted storage and proper consent flows.
-
-- **Private Keys**  
-  The backend uses a server wallet to send votes. The private key is read from `.env` and must **never** be committed.
-
-- **One Vote Per Tag Enforcement**  
-  Enforced **on‑chain** via `has_voted` mapping in the Stylus contract. Even if the backend is compromised, the contract will reject duplicate votes for the same tag.
-
-- **Reentrancy Guard**  
-  `locked` boolean prevents reentrant calls to `cast_vote`, inspired by common Solidity patterns.
-
-- **Owner‑Only Admin**  
-  Only the contract owner can reset votes or transfer ownership; validated via `msg::sender()` checks.
-
----
-
-## Future Improvements
-
-- **Full On‑Chain Biometrics**  
-  Explore on‑chain verification of ZK‑proofs of face embeddings using Stylus’ WASM performance.
-
-- **More Advanced Analytics**  
-  Use Stylus to run richer on‑chain tallying, statistical checks, or anomaly detection thanks to cheaper compute and memory.
-
-- **Multi‑Election Support**  
-  Extend the Rust contract to support multiple parallel elections with separate candidate sets.
-
-- **Event Indexer**  
-  Build a subgraph or custom indexer for `VoteCast` events to power more advanced dashboards.
-
-- **Hardware Security**  
-  Add secure attestation from ESP32 or integrate secure elements for tamper resistance.
-
----
-
-## License
-
-This project is licensed under the **MIT License**. See `LICENSE` for details.
-
----
-
-Built with 🦀 **Rust**, ⚡ **Arbitrum Stylus**, 🧠 **Python**, 📡 **ESP32**, and ❤️ by the team for the **Arbitrum Stylus Hackathon**.
-looks decent, but don't leave out the hardware and DePin +AI+Blockchain aspect of it too making sure you make it sound as unique as possible while keeping the arbitrum stylus emphasis intact
-
-Here’s an updated README.md that keeps the strong Arbitrum Stylus emphasis but also highlights the hardware, DePIN, and AI + Blockchain aspects and makes the project sound more unique and visionary.
-
-text
-# 🏷 RFID Voting System with Face Verification  
-### DePIN + AI + Blockchain on Arbitrum Stylus
+# 🏷️ RFID Voting System with Face Verification
+## DePIN + AI + Blockchain on Arbitrum Stylus
 
 A **hardware‑anchored**, **AI‑verified**, fully on‑chain voting system built on **Arbitrum Stylus**.  
 RFID tags and ESP32 hardware act as a **physical DePIN layer**, Python‑based face recognition provides **AI‑driven identity assurance**, and a **Rust/WASM smart contract** on Arbitrum records every vote immutably.
 
-Built for the **Arbitrum Stylus Hackathon** to demonstrate how **real‑world devices**, **biometrics**, and **Layer‑2 WASM contracts** can combine into a secure, high‑throughput on‑chain election stack.
+> Built for the **Arbitrum Stylus Hackathon** to demonstrate how **real‑world devices**, **biometrics**, and **Layer‑2 WASM contracts** can combine into a secure, high‑throughput on‑chain election stack.
 
 ---
 
 ## 🔥 What Makes This Project Unique?
 
-- **DePIN‑Style Hardware Integration**  
-  The system treats every **ESP32 + MFRC522 RFID terminal** as a **decentralized physical node** in a permissionless voting network. These on‑site devices:
-  - Read RFID tags (voter IDs).
-  - Capture button choices (candidates).
-  - Bridge physical actions into verifiable on‑chain state.
+### 🌐 **DePIN‑Style Hardware Integration**
+The system treats every **ESP32 + MFRC522 RFID terminal** as a **decentralized physical node** in a permissionless voting network. These on‑site devices:
+- 📖 Read RFID tags (voter IDs)
+- 🔘 Capture button choices (candidates)
+- ⛓️ Bridge physical actions into verifiable on‑chain state
 
-- **AI + Blockchain Security Loop**  
-  Before a single transaction hits Arbitrum, an **AI‑powered face recognition pipeline** validates that the person behind the RFID tag matches a pre‑registered identity:
-  - Python + `face_recognition` + OpenCV compare live webcam frames to stored embeddings.
-  - Only when AI verification passes does the backend sign and send a `castVote` transaction.
-  - The result is a **human‑in‑the‑loop, AI‑gated oracle** for on‑chain voting.
+### 🧠 **AI + Blockchain Security Loop**
+Before a single transaction hits Arbitrum, an **AI‑powered face recognition pipeline** validates that the person behind the RFID tag matches a pre‑registered identity:
+- 📸 Python + `face_recognition` + OpenCV compare live webcam frames to stored embeddings
+- ✅ Only when AI verification passes does the backend sign and send a `castVote` transaction
+- 🔐 The result is a **human‑in‑the‑loop, AI‑gated oracle** for on‑chain voting
 
-- **Rust/WASM Smart Contract on Arbitrum Stylus**  
-  Instead of Solidity, the voting logic is implemented in **Rust** and compiled to **WASM** using the Stylus SDK:
-  - Gains **10×+ compute efficiency** and dramatically cheaper memory vs classic EVM.
-  - Leverages **Rust’s type safety** for complex state and rich error handling.
-  - Still exports a **standard EVM‑style ABI** so `ethers.js` can call it like any Solidity contract.
+### 🦀 **Rust/WASM Smart Contract on Arbitrum Stylus**
+Instead of Solidity, the voting logic is implemented in **Rust** and compiled to **WASM** using the Stylus SDK:
+- ⚡ Gains **10×+ compute efficiency** and dramatically cheaper memory vs classic EVM
+- 🔒 Leverages **Rust's type safety** for complex state and rich error handling
+- 🌉 Still exports a **standard EVM‑style ABI** so `ethers.js` can call it like any Solidity contract
 
-- **End‑to‑End On‑Chain Auditability**  
-  Every successful AI‑verified RFID vote ends up in a **public Stylus contract**, enabling:
-  - Transparent recounts.
-  - On‑chain winner selection.
-  - Immutable, queryable history for external indexers or analytics.
-
-This is not just another Web3 voting UI — it is a **DePIN + AI + Stylus** reference architecture for real‑world, tamper‑resistant governance.
+### 📊 **End‑to‑End On‑Chain Auditability**
+Every successful AI‑verified RFID vote ends up in a **public Stylus contract**, enabling:
+- 📈 Transparent recounts
+- 🏆 On‑chain winner selection
+- 📝 Immutable, queryable history for external indexers or analytics
 
 ---
 
-## 📚 Table of Contents
+## 📚 Quick Navigation
 
-- [Overview](#overview)
-- [Why Arbitrum Stylus](#why-arbitrum-stylus)
-- [Hardware & DePIN Layer](#hardware--depin-layer)
-  - [ESP32 + MFRC522 Node](#esp32--mfrc522-node)
-  - [Hardware → Chain Data Flow](#hardware--chain-data-flow)
-- [AI Verification Layer](#ai-verification-layer)
-- [Architecture](#architecture)
-- [Smart Contract (Rust + Stylus)](#smart-contract-rust--stylus)
-  - [Storage Layout](#storage-layout)
-  - [Core Logic](#core-logic)
-  - [Errors & Events](#errors--events)
-  - [Stylus‑Specific Notes](#stylus-specific-notes)
-- [Backend (Node.js + Python)](#backend-nodejs--python)
-- [Frontend (React)](#frontend-react)
-- [Repository Structure](#repository-structure)
-- [Local Development](#local-development)
+- [Architecture & Data Flow](#architecture--data-flow)
+- [System Components](#system-components)
+- [Frontend Interface](#frontend-interface)
+- [Hardware Setup](#hardware-setup)
+- [Smart Contract](#smart-contract-rust--stylus)
+- [Installation & Development](#local-development)
 - [Deployment](#deployment)
-- [Security Considerations](#security-considerations)
+- [Security](#security-considerations)
 - [Future Directions](#future-directions)
-- [License](#license)
 
 ---
 
-## Overview
+## 🏗️ Architecture & Data Flow
 
-At a high level, the system guarantees that:
+### System Data Flow
 
-1. **Only physically present users** with a valid RFID tag **and** matching face can vote.
-2. Each tag can cast **exactly one vote**, enforced directly by the **Stylus Rust contract**.
-3. Votes are recorded on **Arbitrum** in an efficient, transparent, and queryable way.
-4. A web dashboard visualizes the entire election in real time.
+```mermaid
+graph TD
+    A["🏷️ RFID Tag"] -->|Read UID| B["📱 ESP32 + MFRC522"]
+    C["🔘 Button Press"] -->|Candidate ID| B
+    B -->|HTTP POST<br/>tagId + buttonId| D["🖥️ Backend<br/>Node.js + Python"]
+    D -->|Check Status| E["⛓️ Arbitrum Stylus<br/>Smart Contract"]
+    E -->|Has Voted?| D
+    D -->|📸 Open Webcam| F["🧠 Face Verification<br/>AI Oracle"]
+    F -->|Compare Embeddings| G["🖼️ Reference Image<br/>faces/tagId.jpg"]
+    F -->|Success/Failure| D
+    D -->|castVote<br/>Transaction| E
+    E -->|Store Vote| H["💾 On-Chain Storage<br/>StorageVec"]
+    E -->|Emit Event| I["📡 VoteCast Event"]
+    E -->|Update Tally| J["📊 Button Votes Map"]
+    I -->|Query| K["📊 React Dashboard"]
+    H -->|Query All Votes| K
+    J -->|Query Results| K
+```
 
-This combines:
+### Component Architecture
 
-- **DePIN**: A network of physical ESP32 voting terminals you can deploy anywhere.
-- **AI**: Local face recognition as an identity oracle.
-- **Blockchain (L2)**: Arbitrum Stylus for inexpensive, verifiable, and high‑throughput state.
-
----
-
-## Why Arbitrum Stylus
-
-Arbitrum Stylus extends Arbitrum Nitro with a **WASM VM alongside the EVM**, so contracts can be written in Rust, C, C++, etc., yet still interact with EVM contracts and tools.
-
-This project leverages Stylus for:
-
-- **Rust‑Native Smart Contracts**  
-  The heart of the voting logic is written in **Rust** with the Stylus SDK, not Solidity.  
-  That gives:
-  - Memory safety and rich type systems.
-  - Familiar tooling for systems/embedded developers.
-  - Easy sharing of logic between on‑chain and off‑chain Rust if needed.
-
-- **WASM Performance & Cost**  
-  Stylus WASM execution is significantly more **CPU and memory efficient** than pure EVM, which matters for:
-  - Iterating over a growing vector of votes.
-  - Maintaining per‑button tallies.
-  - Running more complex decision logic in the future (e.g., fraud detection or advanced tallying).
-
-- **Interoperability**  
-  Even though the contract is Rust/WASM, the ABI looks like a standard Solidity interface:
-  - `ethers.js` talks to it as if it were a regular Solidity contract.
-  - It could be integrated with Solidity‑based governance systems later.
-
-For a DePIN + AI project like this, Stylus’ **compute‑friendly WASM environment** is a natural fit.
-
----
-
-## Hardware & DePIN Layer
-
-### ESP32 + MFRC522 Node
-
-Each node in the physical network is:
-
-- **ESP32 Dev Board**
-  - WiFi‑capable microcontroller.
-  - Connects to backend over HTTP.
-
-- **MFRC522 RFID Reader**
-  - Reads card or keyfob UIDs.
-  - Serves as the **voter identifier** (tag ID).
-
-- **Physical Buttons**
-  - Each mapped to a candidate (`button_number`).
-  - The combination of `(RFID tag, button press)` forms the **vote intent**.
-
-Arduino sketch: `decentralised_elections/decentralised_elections.ino`
-
-The ESP32 logic:
-
-1. Read RFID UID → `tag_id`.
-2. Detect button press → `button_number`.
-3. Send HTTP POST to backend `/vote`:
-{ "tagId": "9158283", "buttonId": 3 }
-
-text
-4. Await response (success/failure).
-5. Indicate result via onboard LEDs / serial logs.
-
-Deploy multiple ESP32 stations, and you effectively get a **decentralized, hardware‑backed voting network** — a lightweight **DePIN layer** for secure input.
-
-### Hardware → Chain Data Flow
-
-RFID Tag + Button
-│
-▼
-ESP32 Node
-│ (HTTP)
-▼
-Backend API
-(Node.js + Python)
-│ (AI-verified)
-▼
-Arbitrum Stylus Contract
-(Rust/WASM on L2)
-│
-▼
-React Dashboard
-
-text
-
-Each successful roundtrip from a physical device ends as an immutable on‑chain record.
+```mermaid
+graph LR
+    subgraph "🌐 Frontend Layer"
+        FE["React Dashboard<br/>Ethers.js + MetaMask"]
+    end
+    
+    subgraph "🔌 API Layer"
+        API["Express REST API<br/>Node.js"]
+    end
+    
+    subgraph "🧠 AI Layer"
+        AI["Face Verification<br/>Python + OpenCV"]
+    end
+    
+    subgraph "⛓️ Blockchain Layer"
+        SC["Stylus Smart Contract<br/>Rust/WASM<br/>Arbitrum Sepolia"]
+    end
+    
+    subgraph "📱 Hardware Layer"
+        ESP["ESP32 + MFRC522<br/>RFID Terminal"]
+    end
+    
+    FE <-->|REST<br/>HTTPS| API
+    ESP <-->|HTTP| API
+    API -->|Uses| AI
+    API <-->|ethers.js<br/>RPC| SC
+    
+    style FE fill:#a8d5a8
+    style API fill:#7fb3f0
+    style AI fill:#d4a574
+    style SC fill:#d946a6
+    style ESP fill:#d4a574
+```
 
 ---
 
-## AI Verification Layer
+## 🎯 System Components
 
-The AI layer ensures that **physical presence** is more than just an RFID tag:
+### 🖥️ **Backend Server**
+- **Tech Stack**: Node.js + Express + ethers.js v6 + Python
+- **Responsibilities**:
+  - REST API for frontend & ESP32 integration
+  - AI-powered face verification orchestration
+  - Stylus contract interaction & transaction signing
+  - Vote aggregation & historical data queries
 
-- Written in `face_verify.py` using:
-  - `face_recognition` for facial embeddings and distance metrics.
-  - `opencv-python` for webcam capture.
+### 🧠 **AI Verification Layer**
+- **Tech Stack**: Python + face_recognition + OpenCV
+- **Process**:
+  1. Load reference image from `faces/{tagId}.jpg`
+  2. Capture live webcam frames
+  3. Compute facial embeddings using deep learning
+  4. Compare distances; threshold-based approval
+  5. Return verification result to Node.js backend
 
-Flow:
+### ⛓️ **Stylus Smart Contract**
+- **Language**: Rust (compiled to WASM)
+- **Network**: Arbitrum Sepolia
+- **Core Features**:
+  - One vote per RFID tag (enforced on-chain)
+  - Vote history with timestamps
+  - Per-button tallies
+  - Winner computation
+  - Owner-only admin functions
 
-1. Backend receives `/vote` request with `{ tagId, buttonId }`.
-2. Backend checks `checkHasVoted(tagId)` on Stylus contract.
-3. If tag hasn’t voted:
-   - Backend spawns Python script with `tagId`.
-   - Python loads reference image from `backend/faces/{tagId}.jpg`.
-   - Captures live webcam frames; compares each to the reference embedding.
-   - If any frame’s distance < threshold → return success.
-4. Backend only then calls `castVote(tagId, buttonId)` on Stylus.
+### 📱 **ESP32 Hardware Terminal**
+- **Microcontroller**: ESP32 Dev Board
+- **Sensor**: MFRC522 RFID Reader
+- **Input**: 3-5 physical buttons (candidates)
+- **Output**: LEDs, serial feedback
+- **Communication**: WiFi HTTP to backend
 
-Conceptually, this is a **local AI oracle**:
-
-> *“On‑chain state transitions (votes) are only allowed if an off‑chain AI classifier attests to the user’s identity.”*
-
----
-
-## Architecture
-
-text
-                     ┌───────────────────────────┐
-                     │      React Frontend       │
-                     │  - Dashboard & controls   │
-                     │  - Connects via REST      │
-                     └─────────────▲─────────────┘
-                                   │
-                          HTTPS / JSON API
-                                   │
-      ┌────────────────────────────┴───────────────────────────┐
-      │                    Backend Server                      │
-      │      Node.js (Express + ethers.js) + Python           │
-      │  - Exposes /vote, /votes/all, /winner, ...            │
-      │  - Runs Python AI oracle for face verification        │
-      │  - Signs and sends Stylus transactions                │
-      └─────────────▲────────────────────────────┬────────────┘
-                    │                            │
-        HTTP from ESP32                    RPC to Arbitrum
-                    │                            │
-    ┌──────────────┴─────────────┐     ┌────────▼─────────────┐
-    │      ESP32 + MFRC522       │     │  Arbitrum Stylus SC  │
-    │  - RFID tag → tag_id       │     │  (Rust/WASM)         │
-    │  - Buttons → button_id     │     │  - Stores votes      │
-    │  - Sends vote intent       │     │  - One vote / tag    │
-    └────────────────────────────┘     │  - Tally + winner    │
-                                       └───────────────────────┘
-text
+### 💻 **React Frontend Dashboard**
+- **Features**:
+  - Wallet connection (MetaMask)
+  - Real-time voting results
+  - Vote history table
+  - Query tools (tag status, button votes)
+  - Admin panel (pick winner, reset votes)
+  - Live leader board
 
 ---
 
-## Smart Contract (Rust + Stylus)
+## 🎨 Frontend Interface
 
-### Storage Layout
+### Dashboard Layout
 
-sol_storage! {
-#[entrypoint]
+The React dashboard provides a comprehensive voting interface with real-time updates:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  🏷️  RFID VOTING DAPP | ⚡ Arbitrum Stylus | 🔐 Face Verified │
+│                        [🔗 Connect Wallet]                  │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ 🔗 Connected Account: 0x1234...5678                         │
+│ 🌐 Network: Arbitrum Sepolia                                │
+│ 📄 Contract: 0x16f7...9977                                  │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ 🗳️  CAST YOUR VOTE                                           │
+│ ┌──────────────────────────────────────────────────────────┐ │
+│ │ RFID Tag ID: [________________]                           │ │
+│ │ Button Number: [___]                                     │ │
+│ │           [🗳️  CAST VOTE]                                │ │
+│ └──────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ 📊 VOTING RESULTS                                            │
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐           │
+│ │  Total Votes│ │Active Buttons│ │ Contract   │           │
+│ │     145     │ │       5       │ │ Owner      │           │
+│ └─────────────┘ └─────────────┘ └─────────────┘           │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ BUTTON BREAKDOWN                                             │
+│ ┌─────────────────────────────────────────────────────────┐ │
+│ │ Button 1: 🟩🟩🟩🟩🟩 45 votes (31%)                       │ │
+│ │ Button 2: 🟩🟩🟩 38 votes (26%)                         │ │
+│ │ Button 3: 🟩🟩🟩🟩 42 votes (29%)                        │ │
+│ │ Button 4: 🟩🟩 20 votes (14%)                           │ │
+│ └─────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key UI Features
+
+| Feature | Description |
+|---------|-------------|
+| **Wallet Connection** | MetaMask integration for Arbitrum Sepolia |
+| **Vote Casting** | Input RFID tag ID + button number with AI verification flow |
+| **Results Dashboard** | Real-time vote counts, percentages, and visual progress bars |
+| **Vote History** | Full table with tag ID, button, timestamp, and human-readable date |
+| **Query Tools** | Check tag voting status, query button vote counts |
+| **Admin Panel** | Owner-only functions (pick winner, reset votes, refresh data) |
+| **Status Messages** | Color-coded feedback (success 🟢, error 🔴, info 🔵) |
+
+---
+
+## 🔧 Hardware Setup
+
+### Circuit Diagram
+
+```mermaid
+graph LR
+    subgraph ESP["ESP32 Board"]
+        CPU["ESP32 MCU"]
+        WIFI["WiFi Module"]
+    end
+    
+    subgraph RFID["RFID Module"]
+        MFRC["MFRC522"]
+        ANT["Antenna"]
+    end
+    
+    subgraph INPUT["Input Devices"]
+        BTN1["Button 1<br/>Candidate A"]
+        BTN2["Button 2<br/>Candidate B"]
+        BTN3["Button 3<br/>Candidate C"]
+    end
+    
+    subgraph OUTPUT["Output Devices"]
+        LED1["LED Green<br/>Success"]
+        LED2["LED Red<br/>Failed"]
+        SERIAL["Serial/Debug"]
+    end
+    
+    subgraph POWER["Power"]
+        USB["USB 5V"]
+        GND["Ground"]
+    end
+    
+    CPU -->|SPI| MFRC
+    MFRC --> ANT
+    BTN1 --> CPU
+    BTN2 --> CPU
+    BTN3 --> CPU
+    CPU --> LED1
+    CPU --> LED2
+    CPU --> SERIAL
+    CPU --> WIFI
+    WIFI -.->|HTTP| NET["Backend<br/>Server"]
+    USB --> CPU
+    GND --> CPU
+    
+    style ESP fill:#a8d5a8
+    style RFID fill:#7fb3f0
+    style INPUT fill:#d4a574
+    style OUTPUT fill:#d946a6
+```
+
+### Component Specifications
+
+| Component | Specification | Purpose |
+|-----------|---------------|---------|
+| **ESP32 Dev Board** | 32-bit, WiFi + BT, 240MHz | Main controller |
+| **MFRC522** | 13.56MHz RFID Reader | Voter ID capture |
+| **Buttons** | 3-5 momentary switches | Candidate selection |
+| **LEDs** | Green + Red | User feedback |
+| **USB Power** | 5V, 1A | Power supply |
+
+---
+
+## 📸 Hardware & Working Demo
+
+### Circuit Photos
+
+> **Note**: Add circuit board photos here showing:
+> - ESP32 connected to MFRC522 via SPI
+> - Buttons wired to GPIO pins
+> - LED indicators
+> - Power connections
+
+### Working Video
+
+> **[Demo Video Link]** - Shows:
+> - 🏷️ RFID tag being read
+> - 🧠 Face verification process
+> - ✅ Vote successfully cast
+> - 📊 Dashboard updating in real-time
+> - 🏆 Winner determination
+
+---
+
+## ⛓️ Smart Contract (Rust + Stylus)
+
+### Contract Deployment
+
+**Network**: Arbitrum Sepolia  
+**Address**: `0x16f7b54cb4002b5ca98a07ee44d81802e1009977`  
+**Language**: Rust (Stylus SDK)
+
+### Storage Structure
+
+```rust
 pub struct RFIDVoting {
-address owner;
-StorageVec<VoteData> votes;
-mapping(string => bool) has_voted;
-mapping(uint256 => uint256) button_votes;
-bool locked;
+    owner: Address,                    // Contract owner
+    votes: StorageVec<VoteData>,       // All votes history
+    has_voted: StorageMap<String, bool>, // One vote per tag
+    button_votes: StorageMap<U256, U256>, // Per-button tallies
+    locked: bool,                      // Reentrancy guard
 }
 
-text
 pub struct VoteData {
-    StorageString tag_id;
-    uint256 button_number;
-    uint256 timestamp;
+    tag_id: StorageString,
+    button_number: U256,
+    timestamp: U256,
 }
+```
+
+### Core Functions
+
+```rust
+// Initialize contract
+pub fn initialize(&mut self) -> Result<(), RFIDVotingError>
+
+// Cast a vote (called by backend after AI verification)
+pub fn cast_vote(
+    &mut self,
+    tag_id: String,
+    button_number: U256,
+) -> Result<(), RFIDVotingError>
+
+// Get total vote count
+pub fn get_vote_count(&self) -> U256
+
+// Get specific vote by index
+pub fn get_vote(&self, index: U256) -> Result<(String, U256, U256), RFIDVotingError>
+
+// Determine winner
+pub fn pick_winner(&self) -> Result<(U256, U256), RFIDVotingError>
+
+// Reset tag's vote status (owner only)
+pub fn reset_vote(&mut self, tag_id: String) -> Result<(), RFIDVotingError>
+
+// Query helper functions
+pub fn get_button_votes(&self, button_number: U256) -> U256
+pub fn check_has_voted(&self, tag_id: String) -> bool
+```
+
+### Events & Errors
+
+**Events**:
+- `VoteCast(string tag_id, uint256 button_number, uint256 timestamp)`
+- `WinnerDeclared(uint256 winning_button, uint256 votes)`
+- `OwnershipTransferred(address indexed previous_owner, address indexed new_owner)`
+
+**Errors**:
+- `AlreadyVoted` - Tag has voted before
+- `NoVotes` - No votes to process
+- `InvalidIndex` - Vote index out of range
+- `NotOwner` - Caller is not contract owner
+- `ReentrancyGuard` - Reentrancy attempt detected
+
+---
+
+## 🔌 Backend API
+
+### REST Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/health` | GET | Server status check |
+| `/initialize` | POST | Initialize contract |
+| `/vote` | POST | Cast vote with AI verification |
+| `/votes/count` | GET | Total vote count |
+| `/votes/all` | GET | Complete vote history |
+| `/check/:tagId` | GET | Check if tag has voted |
+| `/button/:buttonNumber` | GET | Get button vote count |
+| `/winner` | GET | Get current winning button |
+| `/reset` | POST | Reset tag vote (owner only) |
+| `/owner` | GET | Get contract owner address |
+
+### Request/Response Examples
+
+**Cast Vote**
+```json
+POST /vote
+{
+  "tagId": "9158283",
+  "buttonId": 2
 }
 
-text
+Response:
+{
+  "success": true,
+  "txHash": "0x1234...",
+  "message": "Vote cast successfully"
+}
+```
 
-- **owner**: Controls admin operations (reset votes, transfer ownership).
-- **votes**: Dynamic array of all past votes (`VoteData` entries).
-- **has_voted**: Mapping from `tag_id` → `bool` to enforce “one vote per tag”.
-- **button_votes**: Mapping from `button_number` → `uint256` with live tallies.
-- **locked**: Simple `bool` for reentrancy protection in `cast_vote`.
+**Get All Votes**
+```json
+GET /votes/all
 
-### Core Logic
-
-Key functions (ABI camelCase names are shown):
-
-- `initialize()`  
-  Sets `owner = msg::sender()` and unlocks the contract.
-
-- `castVote(string tag_id, uint256 button_number)`  
-  - Reentrancy guarded via `locked`.
-  - Requires `has_voted[tag_id] == false`.
-  - Appends to `votes`.
-  - Sets `has_voted[tag_id] = true`.
-  - Increments `button_votes[button_number]`.
-  - Emits `VoteCast(tag_id, button_number, timestamp)`.
-
-- `getVoteCount() → uint256`  
-  Returns number of votes.
-
-- `getVote(uint256 index) → (string, uint256, uint256)`  
-  Returns `(tag_id, button, timestamp)` for a given vote.
-
-- `pickWinner() → (uint256 winning_button, uint256 votes)`  
-  Iterates over votes / button_votes to find the most voted button.
-
-- `resetVote(string tag_id)`  
-  Owner‑only. Resets `has_voted[tag_id] = false` to allow revoting.
-
-- `owner() → address`  
-  Simple getter.
-
-- `transferOwnership(address new_owner)`  
-  Owner‑only; updates the owner and emits `OwnershipTransferred`.
-
-- `getButtonVotes(uint256 button_number) → uint256`  
-  Reads the per‑button tally.
-
-- `checkHasVoted(string tag_id) → bool`  
-  Helper for off‑chain checks.
-
-### Errors & Events
-
-Defined via Stylus `sol!` macro for Solidity‑compatible ABI:
-
-- **Events**
-  - `VoteCast(string tag_id, uint256 button_number, uint256 timestamp)`
-  - `WinnerDeclared(uint256 winning_button, uint256 votes)`
-  - `OwnershipTransferred(address previous_owner, address new_owner)`
-
-- **Errors**
-  - `AlreadyVoted(string message)`
-  - `NoVotes(string message)`
-  - `InvalidIndex(string message)`
-  - `NotOwner(string message)`
-  - `ReentrancyGuard(string message)`
-
-### Stylus‑Specific Notes
-
-- Uses `stylus_sdk::evm`, `msg`, and `block`:
-  - `msg::sender()` for caller.
-  - `block::timestamp()` for on‑chain time.
-  - `evm::log()` for emitting events.
-- Uses `StorageString` instead of plain `string` to work with Stylus storage.
-- Exposes a **Solidity‑style interface (`IRFIDVoting`)** for easy `ethers.js` integration.
-- Benefits from Stylus **WASM execution**:
-  - Efficient iteration over `StorageVec<VoteData>` even as the vote list grows.
-  - Potential for more complex logic in future (e.g., fraud heuristic analysis on‑chain).
+Response:
+{
+  "success": true,
+  "totalVotes": 145,
+  "votes": [
+    {
+      "tagId": "TAG001",
+      "buttonNumber": 1,
+      "timestamp": 1699564800,
+      "date": "2024-11-10 10:30:00"
+    },
+    ...
+  ]
+}
+```
 
 ---
 
-## Backend (Node.js + Python)
+## 📦 Repository Structure
 
-- **Node.js / Express** (`rfid-voting-backend/index.js`):
-  - Connects to Arbitrum RPC via `ethers.JsonRpcProvider`.
-  - Loads Stylus ABI from `abi.json`.
-  - Holds a signing wallet using `PRIVATE_KEY` from `.env`.
-  - Implements REST endpoints for:
-    - Initialization
-    - Voting
-    - Vote history
-    - Button tallies
-    - Winner query
-    - Reset and owner management
-
-- **Python AI Module** (`face_verify.py`):
-  - Given a `tagId`, loads `faces/{tagId}.jpg`.
-  - Opens webcam, samples frames.
-  - Computes embedding distance; returns success/failure to Node.
-
----
-
-## Frontend (React)
-
-- Directory: `RFID-voting/rfid-voting-frontend/researchproject`
-- Tech:
-  - React 18
-  - `ethers.js` in browser (for wallet/network checks)
-  - REST calls to backend for data and voting
-- Features:
-  - **Wallet Integration** (MetaMask on Arbitrum Sepolia)
-  - **Initialization Flow** for Stylus contract
-  - **Voting UI** with face‑verification instructions
-  - **Live Dashboard** (total votes, per‑button breakdown, current leader)
-  - **Full Vote History Table**
-  - **Query Tools**:
-    - Check if tag has voted
-    - Button vote count
-  - **Owner Panel**:
-    - Pick winner
-    - Reset tag vote
-    - Refresh data
-
----
-
-## Repository Structure
-
+```
 Arbitrum-Hackathon/
-├── decentralised_elections/
-│ └── decentralised_elections.ino
-├── RFID-voting/
-│ ├── rfid-voting-backend/
-│ │ ├── index.js
-│ │ ├── faceAuth.js
-│ │ ├── face_verify.py
-│ │ ├── abi.json
-│ │ ├── package.json
-│ │ ├── package-lock.json
-│ │ ├── faces/
-│ │ │ └── .gitkeep
-│ │ └── .env.example
-│ └── rfid-voting-frontend/
-│ └── researchproject/
-│ ├── src/
-│ │ ├── App.js
-│ │ └── App.css
-│ ├── public/
-│ ├── package.json
-│ └── README.md
-└── smart-contract/
-├── src/
-│ └── lib.rs # Rust Stylus contract
-├── Cargo.toml
-└── README.md
-
-text
-
----
-
-## Local Development
-
-(unchanged from previous version; include your actual commands here – contract build, backend, frontend, and Arduino steps as already set up.)
+├── 📁 decentralised_elections/
+│   └── decentralised_elections.ino
+│
+├── 📁 RFID-voting/
+│   ├── 📁 rfid-voting-backend/
+│   │   ├── index.js                 # Express server
+│   │   ├── faceAuth.js              # Python wrapper
+│   │   ├── face_verify.py           # AI verification
+│   │   ├── abi.json                 # Stylus contract ABI
+│   │   ├── faces/                   # Reference images
+│   │   ├── package.json
+│   │   └── .env.example
+│   │
+│   └── 📁 rfid-voting-frontend/
+│       └── 📁 researchproject/
+│           ├── src/
+│           │   ├── App.js
+│           │   └── App.css
+│           ├── public/
+│           ├── package.json
+│           └── README.md
+│
+└── 📁 smart-contract/
+    ├── src/
+    │   └── lib.rs                   # Rust contract source
+    ├── Cargo.toml
+    └── README.md
+```
 
 ---
 
-## Deployment
+## 🚀 Local Development
 
-- **Backend**: Railway / Render / custom VPS (Node + Python support).
-- **Frontend**: Vercel (React app).
-- **Contract**: Arbitrum Sepolia via `cargo stylus deploy`.
+### Prerequisites
 
-Remember to:
-- Set `REACT_APP_BACKEND_URL` in the frontend to your deployed backend URL.
-- Configure backend `.env` with correct RPC, private key, and contract address.
+- **Node.js** 16+ & npm
+- **Python** 3.8+ with pip
+- **Rust** (stable) with Stylus toolchain
+- **Arduino IDE** for ESP32
+- **MetaMask** browser extension
+
+### 1️⃣ Smart Contract Setup
+
+```bash
+cd smart-contract
+
+# Check the contract compiles
+cargo stylus check
+
+# Deploy to Arbitrum Sepolia
+cargo stylus deploy \
+  --private-key YOUR_PRIVATE_KEY \
+  --rpc-url https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY
+
+# Save the deployed address to .env
+```
+
+### 2️⃣ Backend Setup
+
+```bash
+cd RFID-voting/rfid-voting-backend
+
+# Install dependencies
+npm install
+
+# Setup Python environment
+python -m venv .venv
+source .venv/bin/activate  # or `.venv\Scripts\activate` on Windows
+pip install face_recognition opencv-python numpy
+
+# Create environment file
+cp .env.example .env
+
+# Edit .env with your values:
+# ALCHEMY_RPC_URL=https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY
+# PRIVATE_KEY=your_wallet_private_key
+# CONTRACT_ADDRESS=0x16f7b54cb4002b5ca98a07ee44d81802e1009977
+# PORT=3000
+
+# Start backend
+node index.js
+```
+
+### 3️⃣ Frontend Setup
+
+```bash
+cd RFID-voting/rfid-voting-frontend/researchproject
+
+npm install
+
+# Create environment file (optional)
+echo "REACT_APP_BACKEND_URL=http://localhost:3000" > .env
+
+# Start development server
+npm start
+```
+
+Frontend will open at `http://localhost:3000`
+
+### 4️⃣ ESP32 Arduino Setup
+
+1. Open **Arduino IDE**
+2. Install ESP32 board package:
+   - Boards Manager → Search "ESP32" → Install
+3. Install libraries:
+   - Library Manager → Search "MFRC522" → Install
+4. Open `decentralised_elections/decentralised_elections.ino`
+5. Update WiFi credentials and backend URL
+6. Select **ESP32 Dev Module** board
+7. Upload sketch
 
 ---
 
-## Security Considerations
+## 🌐 Deployment
 
-- Voter’s **on‑chain identity** is just a `tag_id` string; biometrics never leave the local environment.
-- Stylus contract enforces **one vote per tag**.
-- Biometric security, hardware tamper resistance, and key management are treated seriously, but this repo is still a **research/hackathon‑grade prototype**, not production voting infrastructure.
+### Backend Deployment (Railway / Render)
+
+1. Push repository to GitHub
+2. Connect to Railway or Render
+3. Set root directory: `RFID-voting/rfid-voting-backend`
+4. Set start script: `node index.js`
+5. Configure environment variables:
+   - `ALCHEMY_RPC_URL`
+   - `PRIVATE_KEY`
+   - `CONTRACT_ADDRESS`
+   - `PORT`
+
+### Frontend Deployment (Vercel)
+
+1. Import repository to Vercel
+2. Set project root: `RFID-voting/rfid-voting-frontend/researchproject`
+3. Add environment variable:
+   - `REACT_APP_BACKEND_URL=https://your-backend-url.com`
+4. Deploy
+
+### Smart Contract Deployment
+
+```bash
+cd smart-contract
+
+cargo stylus deploy \
+  --private-key YOUR_PRIVATE_KEY \
+  --rpc-url https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY
+```
 
 ---
 
-## Future Directions
+## 🔐 Security Considerations
 
-- **On‑chain ZK proofs of identity** using Stylus’ WASM power to verify succinct proofs of AI verification.
-- **Fully decentralized DePIN** of voting terminals with incentive mechanisms for honest operation.
-- **Multi‑election support**: parameterized elections, candidates, and time windows.
-- **On‑chain analytics**: Stylus‑powered heavy computation for turnout analysis and anomaly detection.
-- **Hardware attestation**: integrate secure elements or trusted execution on ESP32‑class hardware.
+### 🛡️ On-Chain Security
+
+- ✅ **One Vote Per Tag**: Enforced by `has_voted` mapping in Stylus contract
+- ✅ **Reentrancy Protection**: Lock mechanism in `cast_vote` function
+- ✅ **Owner Validation**: All admin functions check `msg::sender()`
+- ✅ **Immutable History**: All votes stored permanently on-chain
+
+### 🔒 Biometric Security
+
+- ✅ **Local Processing**: Face images never leave the local environment
+- ✅ **Threshold-Based**: Facial distance comparison with tuned threshold
+- ✅ **Reference Storage**: Pre-registered faces stored locally, not on-chain
+
+### 🔑 Private Key Management
+
+- ✅ **Environment Variables**: Private keys in `.env` (never committed)
+- ✅ **Server-Side Signing**: Only backend signs transactions
+- ✅ **RPC Integration**: Uses Alchemy or similar trusted RPC
+
+### ⚠️ Limitations
+
+This is a **research/hackathon prototype**, not production-grade voting infrastructure:
+- Biometric verification threshold needs tuning for your environment
+- Hardware security depends on physical terminal setup
+- No formal security audit completed
 
 ---
 
-## License
+## 🚀 Future Directions
 
-MIT License – see `LICENSE` file.
+### 🔮 Advanced Features
+
+- **ZK Proofs**: On-chain verification of face embedding proofs using Stylus WASM
+- **Multi-Election Support**: Parameterized elections with separate candidate sets
+- **On-Chain Analytics**: Heavy computation for turnout analysis and anomaly detection
+- **DAO Integration**: Connect to Arbitrum governance systems
+- **Hardware Attestation**: Secure enclave support for ESP32-class hardware
+
+### 💡 Research Opportunities
+
+- Decentralized DePIN networks with incentive mechanisms
+- Federated learning for biometric models
+- Cross-chain vote aggregation
+- Scalability improvements using Arbitrum's latest features
 
 ---
 
-Built with 🦀 **Rust**, ⚡ **Arbitrum Stylus**, 🧠 **AI**, 📡 **ESP32 RFID hardware**, and ❤️ by the team for the **Arbitrum Stylus Hackathon**.
+## 📄 License
+
+MIT License – See `LICENSE` file for details.
+
+---
+
+## 🙏 Acknowledgments
+
+Built with 🦀 **Rust** | ⚡ **Arbitrum Stylus** | 🧠 **AI/ML** | 📡 **IoT Hardware** | ❤️ **for the Arbitrum Stylus Hackathon**
+
+---
+
+## 📞 Support & Resources
+
+- **Arbitrum Stylus Docs**: https://docs.arbitrum.io/stylus/
+- **Stylus SDK**: https://github.com/OffchainLabs/stylus-sdk-rs
+- **ethers.js**: https://docs.ethers.org/v6/
+- **MFRC522 Library**: https://github.com/miguelbalboa/rfid
+
+---
+
+**Questions?** Open an issue or reach out to the team! 🚀
